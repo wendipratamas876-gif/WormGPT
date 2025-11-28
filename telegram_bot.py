@@ -1,5 +1,4 @@
 import os
-import requests
 import json
 import time
 from pathlib import Path
@@ -12,17 +11,31 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+# Import Library Gemini
+from google import genai
+from google.genai import types
 
 # === Config / Env ===
 CONFIG_FILE = "wormgpt_config.json"
 PROMPT_FILE = "system-prompt.txt"
 USER_LANG_FILE = "user_langs.json"
 
-MODEL_CONFIG = {
-    "name": "tngtech/deepseek-r1t2-chimera:free",
-    "base_url": "https://openrouter.ai/api/v1",
-    "key": os.getenv("OPENROUTER_KEY"),
-}
+# Load Config JSON (Hanya ambil nama model)
+if os.path.exists(CONFIG_FILE):
+    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+        JSON_CONF = json.load(f)
+        MODEL_NAME = JSON_CONF.get("model", "gemini-2.5-flash")
+else:
+    MODEL_NAME = "gemini-2.5-flash"
+
+# Setup Client Gemini dari Environment Variable
+# Pastikan di Codespaces sudah set GEMINI_API_KEY
+API_KEY = os.getenv("GEMINI_API_KEY")
+client = None
+if API_KEY:
+    client = genai.Client(api_key=API_KEY)
+else:
+    print("⚠️ PERINGATAN: GEMINI_API_KEY belum diset di Environment!")
 
 SITE_URL = "https://github.com/jailideaid/WormGPT"
 SITE_NAME = "WormGPT CLI [ Dangerous And Unsafe ⚠️ ]"
@@ -65,6 +78,10 @@ CHAT_MEMORY = load_memory()
 def add_to_history(user_id: str, role: str, content: str):
     if user_id not in CHAT_MEMORY:
         CHAT_MEMORY[user_id] = []
+
+    # Gemini menggunakan role 'model' bukan 'assistant', kita sesuaikan otomatis
+    if role == "assistant": 
+        role = "model"
 
     CHAT_MEMORY[user_id].append({"role": role, "content": content})
 
@@ -112,7 +129,7 @@ def make_system_prompt(lang_code: str) -> str:
 # === /start handler ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_user = await context.bot.get_me()
-    context.bot_data["username"] = bot_user.username  # ✅ FIX no attribute error
+    context.bot_data["username"] = bot_user.username
 
     keyboard = [
         [
@@ -124,7 +141,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         f"👋 Welcome {SITE_NAME}\n"
         f"\n"
-        f"🤖 Model AI : DeepSeekV3\n"
+        f"🤖 Model AI : {MODEL_NAME}\n"
         f"🌐 Repo : {SITE_URL}\n"
         f"\n"
         f"Please choose your language / Silakan pilih bahasa:"
@@ -159,8 +176,12 @@ def get_user_lang(user_id: int) -> str:
 
 # === Message Handler ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not client:
+        await update.message.reply_text("❌ Server Error: API Key belum disetting.")
+        return
+
     bot_username = context.bot_data.get("username", "")
-    user_id = update.message.from_user.id
+    user_id = str(update.message.from_user.id) # Convert ke string agar konsisten dengan JSON key
     user_msg = update.message.text or ""
     chat_type = update.message.chat.type
 
@@ -180,21 +201,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return  # ignore
 
     # === Build worm prompt ===
-    lang = get_user_lang(user_id)
+    lang = get_user_lang(int(user_id))
     system_prompt = make_system_prompt(lang)
 
-    payload = {
-        "model": MODEL_CONFIG["name"],
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ],
-    }
-
-    headers = {
-        "Authorization": f"Bearer {MODEL_CONFIG['key']}",
-        "Content-Type": "application/json",
-    }
+    # === PREPARE GEMINI PAYLOAD ===
+    # Ambil history lama
+    history = CHAT_MEMORY.get(user_id, [])
+    
+    # Konversi format history kita ke format Gemini (Content object)
+    gemini_contents = []
+    
+    for msg in history:
+        # Mapping role: 'assistant' -> 'model' untuk Gemini
+        role = msg['role']
+        if role == 'assistant': role = 'model'
+        
+        gemini_contents.append(
+            types.Content(role=role, parts=[types.Part.from_text(text=msg['content'])])
+        )
+    
+    # Tambahkan pesan user terbaru
+    gemini_contents.append(
+        types.Content(role='user', parts=[types.Part.from_text(text=user_msg)])
+    )
 
     try:
         await update.message.chat.send_action("typing")
@@ -202,18 +231,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     try:
-        res = requests.post(
-            f"{MODEL_CONFIG['base_url']}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=30,
+        # === CALL GEMINI API ===
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=gemini_contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt  # System prompt masuk sini di Gemini
+            )
         )
 
-        if res.status_code != 200:
-            reply = f"⚠️ API ERROR {res.status_code}\n{res.text}"
+        if response.text:
+            reply = response.text
+            
+            # Simpan ke memori (tetap pakai logika simpan yang sama)
+            add_to_history(user_id, "user", user_msg)
+            add_to_history(user_id, "model", reply)
         else:
-            data = res.json()
-            reply = data["choices"][0]["message"]["content"]
+            reply = "⚠️ Error: Model tidak mengeluarkan text."
 
     except Exception as e:
         reply = f"❌ Request failed: {e}"
@@ -239,6 +273,10 @@ async def setlang_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # === Build App ===
+if not TELEGRAM_TOKEN:
+    print("❌ ERROR: TELEGRAM_TOKEN belum diset!")
+    exit(1)
+
 app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
 app.add_handler(CommandHandler("start", start))
@@ -249,5 +287,8 @@ app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
 # === Run Bot ===
 def run_bot():
-    print("🚀 WormGPT Bot Running... (DeepSeek)")
+    print(f"🚀 WormGPT Bot Running... (Model: {MODEL_NAME})")
     app.run_polling()
+
+if __name__ == "__main__":
+    run_bot()
